@@ -209,8 +209,7 @@ INSTALLED_APPS = (
     'oscar.apps.promotions',
     'oscar.apps.reports',
     'oscar.apps.search',
-    'oscar.apps.catalogue_import',
-    'oscar.apps.product_adjustments',
+    'oscar.apps.voucher',
     'pyzen',
     'sorl.thumbnail',
 )

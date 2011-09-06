@@ -94,7 +94,7 @@ class AbstractAddress(models.Model):
         """
         self._clean_fields()
         fields = filter(lambda x: x, [self.salutation(), self.line1, self.line2, self.line3,
-                                      self.line4, self.postcode])
+                                      self.line4, self.state, self.postcode])
         if self.country:
             fields.append(self.country.name)
         return fields
@@ -150,6 +150,16 @@ class AbstractShippingAddress(AbstractAddress):
         abstract = True
         verbose_name_plural = "shipping addresses"
         
+    @property    
+    def order(self):
+        """
+        Return the order linked to this shipping address
+        """
+        orders = self.order_set.all()
+        if not orders:
+            return None
+        return orders[0]
+        
         
 class AbstractUserAddress(AbstractShippingAddress):
     """
@@ -199,4 +209,14 @@ class AbstractBillingAddress(AbstractAddress):
     
     class Meta:
         abstract = True
-        verbose_name_plural = "Billing addresses"    
+        verbose_name_plural = "Billing addresses"   
+        
+    @property    
+    def order(self):
+        """
+        Return the order linked to this shipping address
+        """
+        orders = self.order_set.all()
+        if not orders:
+            return None
+        return orders[0] 

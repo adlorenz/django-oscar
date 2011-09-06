@@ -8,6 +8,9 @@ from django.db.models import get_model
 
 from oscar.models.fields import ExtendedURLField
 
+from oscar.core.loading import import_module
+catalogue_models = import_module('catalogue.models', ['Product',])
+
 Item = get_model('product', 'Item')
 
 # Linking models
@@ -74,6 +77,8 @@ class AbstractPromotion(models.Model):
     that subclasses must implement.
     """
     _type = 'Promotion'
+    keywords = generic.GenericRelation(KeywordPromotion)
+    pages = generic.GenericRelation(PagePromotion)
     
     class Meta:
         abstract = True
@@ -114,7 +119,7 @@ class RawHTML(AbstractPromotion):
     name = models.CharField(_("Name"), max_length=128)
     body = models.TextField(_("HTML"))
     date_created = models.DateTimeField(auto_now_add=True)
-    
+
     class Meta:
         verbose_name_plural = 'Raw HTML'
         
@@ -133,7 +138,7 @@ class Image(AbstractPromotion):
     name = models.CharField(_("Name"), max_length=128)
     link_url = ExtendedURLField(blank=True, null=True, help_text="""This is 
         where this promotion links to""")
-    image = models.ImageField(upload_to=settings.OSCAR_PROMOTION_FOLDER, blank=True, null=True)
+    image = models.ImageField(upload_to=settings.OSCAR_PROMOTION_FOLDER)
     date_created = models.DateTimeField(auto_now_add=True)
     
     def __unicode__(self):
@@ -190,6 +195,9 @@ class HandPickedProductList(AbstractProductList):
     """
     _type = 'Product list'
     products = models.ManyToManyField('catalogue.Product', through='OrderedProduct', blank=True, null=True)
+
+    def get_products(self):
+        return self.products.all().order_by('%s.display_order' % OrderedProduct._meta.db_table)
     
 
 class OrderedProduct(models.Model):
@@ -219,12 +227,11 @@ class AutomaticProductList(AbstractProductList):
         return Product.objects.all().order_by('-date_created')[:self.num_products]
 
 
-class OrderedProductList(models.Model):
-    
-    tabbed_block = models.ForeignKey('promotions.TabbedBlock')
-    list = models.ForeignKey('promotions.HandPickedProductList')
+class OrderedProductList(HandPickedProductList):
+    tabbed_block = models.ForeignKey('promotions.TabbedBlock',
+                                     related_name='tabs')
     display_order = models.PositiveIntegerField(default=0)
-    
+
     class Meta:
         ordering = ('display_order',)
 
@@ -233,7 +240,5 @@ class TabbedBlock(AbstractPromotion):
 
     _type = 'Tabbed block'
     name = models.CharField(_("Title"), max_length=255)
-    tabs = models.ManyToManyField('promotions.HandPickedProductList', through='OrderedProductList', null=True, blank=True)
     date_created = models.DateTimeField(auto_now_add=True)
-    
-    
+

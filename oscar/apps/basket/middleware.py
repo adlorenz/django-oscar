@@ -2,13 +2,12 @@ import zlib
 
 from django.conf import settings
 from django.core.exceptions import SuspiciousOperation
-
 from django.db.models import get_model
 
 from oscar.core.loading import import_module
 import_module('offer.utils', ['Applicator'], locals())
-
 basket_model = get_model('basket', 'basket')
+
 
 class BasketMiddleware(object):
     
@@ -70,7 +69,10 @@ class BasketMiddleware(object):
         """
         basket = None
         if cookie_key in request.COOKIES:
-            basket_id, basket_hash = request.COOKIES[cookie_key].split("_")
+            parts = request.COOKIES[cookie_key].split("_")
+            if len(parts) != 2:
+                return basket
+            basket_id, basket_hash = parts
             if basket_hash == self.get_basket_hash(basket_id):
                 try:
                     basket = basket_model.objects.get(pk=basket_id, owner=None)

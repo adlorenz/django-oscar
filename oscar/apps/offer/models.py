@@ -2,17 +2,19 @@ from decimal import Decimal
 import math
 import datetime
 
-from django.contrib.auth.models import User
+from django.core import exceptions
 from django.db import models
 from django.utils.translation import ugettext as _
 from django.core.exceptions import ValidationError
 
 from oscar.apps.offer.managers import ActiveOfferManager
+from oscar.models.fields import PositiveDecimalField
 
 SITE, VOUCHER, USER, SESSION = ("Site", "Voucher", "User", "Session")
 
+
 class ConditionalOffer(models.Model):
-    u"""
+    """
     A conditional offer (eg buy 1, get 10% off)
     """
     name = models.CharField(max_length=128)
@@ -63,6 +65,10 @@ class ConditionalOffer(models.Model):
         
     def __unicode__(self):
         return self.name    
+
+    def clean(self):
+        if self.start_date and self.end_date and self.start_date > self.end_date:
+            raise exceptions.ValidationError('End date should be later than start date')
         
     def is_active(self, test_date=None):
         if not test_date:
@@ -128,8 +134,8 @@ class Condition(models.Model):
     )
     range = models.ForeignKey('offer.Range')
     type = models.CharField(max_length=128, choices=TYPE_CHOICES)
-    value = models.DecimalField(decimal_places=2, max_digits=12)
-    
+    value = PositiveDecimalField(decimal_places=2, max_digits=12)
+
     def __unicode__(self):
         if self.type == self.COUNT:
             return u"Basket includes %d item(s) from %s" % (self.value, str(self.range).lower())
@@ -159,10 +165,10 @@ class Benefit(models.Model):
     )
     range = models.ForeignKey('offer.Range', null=True, blank=True)
     type = models.CharField(max_length=128, choices=TYPE_CHOICES)
-    value = models.DecimalField(decimal_places=2, max_digits=12)
-    
+    value = PositiveDecimalField(decimal_places=2, max_digits=12)
+
     price_field = 'price_incl_tax'
-    
+
     # If this is not set, then there is no upper limit on how many products 
     # can be discounted by this benefit.
     max_affected_items = models.PositiveIntegerField(blank=True, null=True, help_text="""Set this
@@ -188,7 +194,7 @@ class Benefit(models.Model):
     
     def clean(self):
         # All benefits need a range apart from FIXED_PRICE
-        if self.type != self.FIXED_PRICE and not self.range:
+        if self.type and self.type != self.FIXED_PRICE and not self.range:
             raise ValidationError("Benefits of type %s need a range" % self.type)
         
     def _effective_max_affected_items(self):
@@ -203,16 +209,17 @@ class Range(models.Model):
     u"""
     Represents a range of products that can be used within an offer
     """
-    name = models.CharField(_("Name"), max_length=128)
+    name = models.CharField(_("Name"), max_length=128, unique=True)
     includes_all_products = models.BooleanField(default=False)
     included_products = models.ManyToManyField('catalogue.Product', related_name='includes', blank=True)
     excluded_products = models.ManyToManyField('catalogue.Product', related_name='excludes', blank=True)
     classes = models.ManyToManyField('catalogue.ProductClass', related_name='classes', blank=True)
+    included_categories = models.ManyToManyField('catalogue.Category', related_name='includes', blank=True)
     
     __included_product_ids = None
     __excluded_product_ids = None
     __class_ids = None
-    
+
     def __unicode__(self):
         return self.name    
         
@@ -242,103 +249,6 @@ class Range(models.Model):
             self.__class_ids = [row['id'] for row in self.classes.values('id')]
         return self.__class_ids
         
-        
-class Voucher(models.Model):
-    u"""
-    A voucher.  This is simply a link to a collection of offers
-
-    Note that there are three possible "usage" models:
-    (a) Single use
-    (b) Multi-use
-    (c) Once per customer
-    """
-    name = models.CharField(_("Name"), max_length=128,
-        help_text="""This will be shown in the checkout and basket once the voucher is entered""")
-    code = models.CharField(_("Code"), max_length=128, db_index=True, unique=True,
-        help_text="""Case insensitive / No spaces allowed""")
-    offers = models.ManyToManyField('offer.ConditionalOFfer', related_name='vouchers', 
-                                    limit_choices_to={'offer_type': VOUCHER})
-
-    SINGLE_USE, MULTI_USE, ONCE_PER_CUSTOMER = ('Single use', 'Multi-use', 'Once per customer')
-    USAGE_CHOICES = (
-        (SINGLE_USE, "Can only be used by one customer"),
-        (MULTI_USE, "Can only be used any number of times"),
-        (ONCE_PER_CUSTOMER, "Can be used once by each customer"),
-    )
-    usage = models.CharField(_("Usage"), max_length=128, choices=USAGE_CHOICES, default=MULTI_USE)
-
-    start_date = models.DateField()
-    end_date = models.DateField()
-
-    # Summary information
-    num_basket_additions = models.PositiveIntegerField(default=0)
-    num_orders = models.PositiveIntegerField(default=0)
-    total_discount = models.DecimalField(decimal_places=2, max_digits=12, default=Decimal('0.00'))
-    
-    date_created = models.DateField(auto_now_add=True)
-
-    class Meta:
-        get_latest_by = 'date_created'
-
-    def __unicode__(self):
-        return self.name
-
-    def save(self, *args, **kwargs):
-        self.code = self.code.upper()
-        super(Voucher, self).save(*args, **kwargs)
-
-    def is_active(self, test_date=None):
-        u"""
-        Tests whether this voucher is currently active.
-        """
-        if not test_date:
-            test_date = datetime.date.today()
-        return self.start_date <= test_date and test_date < self.end_date
-
-    def is_available_to_user(self, user=None):
-        u"""
-        Tests whether this voucher is available to the passed user.
-        
-        Returns a tuple of a boolean for whether it is successulf, and a message
-        """
-        is_available, message = False, ''
-        if self.usage == self.SINGLE_USE:
-            is_available = self.applications.count() == 0
-            if not is_available:
-                message = "This voucher has already been used"
-        elif self.usage == self.MULTI_USE:
-            is_available = True
-        elif self.usage == self.ONCE_PER_CUSTOMER:
-            if not user.is_authenticated():
-                is_available = False
-                message = "This voucher is only available to signed in users"
-            else:
-                is_available = self.applications.filter(voucher=self, user=user).count() == 0
-                if not is_available:
-                    message = "You have already used this voucher in a previous order"
-        return is_available, message
-    
-    def record_usage(self, order, user):
-        u"""
-        Records a usage of this voucher in an order.
-        """
-        self.applications.create(voucher=self, order=order, user=user)
-
-
-class VoucherApplication(models.Model):
-    u"""
-    For tracking how often a voucher has been used
-    """
-    voucher = models.ForeignKey('offer.Voucher', related_name="applications")
-    # It is possible for an anonymous user to apply a voucher so we need to allow
-    # the user to be nullable
-    user = models.ForeignKey('auth.User', blank=True, null=True)
-    order = models.ForeignKey('order.Order')
-    date_created = models.DateField(auto_now_add=True)
-
-    def __unicode__(self):
-        return u"'%s' used by '%s'" % (self.voucher, self.user)
-
 
 class CountCondition(Condition):
     u"""
@@ -477,7 +387,7 @@ class PercentageDiscountBenefit(Benefit):
                 price = getattr(line.product.stockrecord, self.price_field)
                 quantity = min(line.quantity_without_discount, 
                                max_affected_items - affected_items)
-                discount += self.value/100 * price * quantity
+                discount += self.value/100 * price * int(quantity)
                 affected_items += quantity
                 line.discount(discount, quantity)
         if discount > 0 and condition:
@@ -507,7 +417,7 @@ class AbsoluteDiscountBenefit(Benefit):
                 quantity = min(line.quantity_without_discount, 
                                max_affected_items - affected_items,
                                math.floor(remaining_discount / price))
-                discount += price * Decimal(str(quantity))
+                discount += price * int(quantity)
                 affected_items += quantity
                 line.discount(discount, quantity)
         if discount > 0 and condition:

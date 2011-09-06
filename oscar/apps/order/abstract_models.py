@@ -1,4 +1,5 @@
 from itertools import chain
+from decimal import Decimal as D
 
 from django.db import models
 from django.contrib.auth.models import User
@@ -9,7 +10,10 @@ from django.template import Template, Context
 
 
 class AbstractOrder(models.Model):
-    u"""An order"""
+    """
+    The main order model
+    """
+    
     number = models.CharField(_("Order number"), max_length=128, db_index=True)
     # We track the site that each order is placed within
     site = models.ForeignKey('sites.Site')
@@ -49,6 +53,23 @@ class AbstractOrder(models.Model):
     def basket_total_excl_tax(self):
         u"""Return basket total excluding tax"""
         return self.total_excl_tax - self.shipping_excl_tax
+    
+    @property
+    def total_discount_incl_tax(self):
+        """
+        The amount of discount this order received
+        """
+        discount = D('0.00')
+        for line in self.lines.all():
+            discount += line.discount_incl_tax
+        return discount
+    
+    @property
+    def total_discount_excl_tax(self):
+        discount = D('0.00')
+        for line in self.lines.all():
+            discount += line.discount_excl_tax
+        return discount
     
     @property
     def num_lines(self):
@@ -123,6 +144,7 @@ class AbstractOrderNote(models.Model):
     user = models.ForeignKey('auth.User', null=True)
     
     # We allow notes to be classified although this isn't always needed
+    INFO, WARNING, ERROR = 'Info', 'Warning', 'Error'
     note_type = models.CharField(max_length=128, null=True)
     
     message = models.TextField()
@@ -138,7 +160,8 @@ class AbstractOrderNote(models.Model):
 class AbstractCommunicationEvent(models.Model):
     """
     An order-level event involving a communication to the customer, such
-    as an confirmation email being sent."""
+    as an confirmation email being sent.
+    """
     order = models.ForeignKey('order.Order', related_name="communication_events")
     type = models.ForeignKey('customer.CommunicationEventType')
     date = models.DateTimeField(auto_now_add=True)
@@ -193,7 +216,8 @@ class AbstractLine(models.Model):
         help_text=_("This is the item number that the partner uses within their system"))
     partner_line_notes = models.TextField(blank=True, null=True)
     
-    # Partners often want to assign some status to each line.
+    # Partners often want to assign some status to each line to help with their own 
+    # business processes.
     status = models.CharField(_("Status"), max_length=255, null=True, blank=True)
     
     # Estimated dispatch date - should be set at order time
@@ -205,13 +229,21 @@ class AbstractLine(models.Model):
         Returns a description of this line including details of any 
         line attributes.
         """
-        d = str(self.product)
+        desc = self.title
         ops = []
         for attribute in self.attributes.all():
             ops.append("%s = '%s'" % (attribute.type, attribute.value))
         if ops:
-            d = "%s (%s)" % (d, ", ".join(ops))
-        return d
+            desc = "%s (%s)" % (desc, ", ".join(ops))
+        return desc
+    
+    @property
+    def discount_incl_tax(self):
+        return self.line_price_before_discounts_incl_tax - self.line_price_incl_tax
+    
+    @property
+    def discount_excl_tax(self):
+        return self.line_price_before_discounts_excl_tax - self.line_price_excl_tax
     
     @property
     def shipping_status(self):
@@ -330,7 +362,7 @@ class AbstractPaymentEventType(models.Model):
    
    
 class AbstractPaymentEvent(models.Model):    
-    u"""
+    """
     An event is something which happens to a line such as
     payment being taken for 2 items, or 1 item being dispatched.
     """
@@ -349,7 +381,9 @@ class AbstractPaymentEvent(models.Model):
 
 
 class PaymentEventQuantity(models.Model):
-    u"""A "through" model linking lines to payment events"""
+    """
+    A "through" model linking lines to payment events
+    """
     event = models.ForeignKey('order.PaymentEvent', related_name='line_quantities')
     line = models.ForeignKey('order.Line')
     quantity = models.PositiveIntegerField()
@@ -443,15 +477,23 @@ class AbstractShippingEventType(models.Model):
         
         
 class AbstractOrderDiscount(models.Model):
+    """
+    A discount against an order.
     
+    Normally only used for display purposes so an order can be listed with discounts displayed
+    separately even though in reality, the discounts are applied at the line level.
+    """
     order = models.ForeignKey('order.Order', related_name="discounts")
     offer = models.ForeignKey('offer.ConditionalOffer', null=True, on_delete=models.SET_NULL)
-    voucher = models.ForeignKey('offer.Voucher', related_name="discount_vouchers", null=True, on_delete=models.SET_NULL)
-    voucher_code = models.CharField(_("Code"), max_length=128, db_index=True)
+    voucher = models.ForeignKey('voucher.Voucher', related_name="discount_vouchers", null=True, on_delete=models.SET_NULL)
+    voucher_code = models.CharField(_("Code"), max_length=128, db_index=True, null=True)
     amount = models.DecimalField(decimal_places=2, max_digits=12, default=0)
     
     class Meta:
         abstract = True
+        
+    def __unicode__(self):
+        return u"Discount of %r from order %s" % (self.amount, self.order)    
         
     def description(self):
         if self.voucher_code:

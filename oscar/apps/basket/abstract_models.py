@@ -26,7 +26,7 @@ class AbstractBasket(models.Model):
         (SUBMITTED, _("Submitted - has been ordered at the checkout")),
     )
     status = models.CharField(_("Status"), max_length=128, default=OPEN, choices=STATUS_CHOICES)
-    vouchers = models.ManyToManyField('offer.Voucher', null=True)
+    vouchers = models.ManyToManyField('voucher.Voucher', null=True)
     
     date_created = models.DateTimeField(auto_now_add=True)
     date_merged = models.DateTimeField(null=True, blank=True)
@@ -62,13 +62,15 @@ class AbstractBasket(models.Model):
             raise PermissionDenied("A frozen basket cannot be flushed")
         self.lines_all().delete()
     
-    def add_product(self, item, quantity=1, options=[]):
+    def add_product(self, item, quantity=1, options=None):
         """
         Convenience method for adding products to a basket
         
         The 'options' list should contains dicts with keys 'option' and 'value'
         which link the relevant product.Option model and string value respectively.
         """
+        if options is None:
+            options = []
         if not self.id:
             self.save()
         line_ref = self._create_line_reference(item, options)
@@ -97,15 +99,15 @@ class AbstractBasket(models.Model):
         """
         try:
             existing_line = self.lines.get(line_reference=line.line_reference)
-            
-            # Line already exists - bump its quantity and delete the old
-            existing_line.quantity += line.quantity
-            existing_line.save()
-            line.delete()
         except ObjectDoesNotExist:
             # Line does not already exist - reassign its basket
             line.basket = self
             line.save()
+        else:
+            # Line already exists - bump its quantity and delete the old
+            existing_line.quantity += line.quantity
+            existing_line.save()
+            line.delete()
     
     def merge(self, basket):
         """
@@ -157,7 +159,11 @@ class AbstractBasket(models.Model):
         """
         total = Decimal('0.00')
         for line in self.all_lines():
-            total += getattr(line, property)
+            try:
+                total += getattr(line, property)
+            except ObjectDoesNotExist:
+                # Handle situation where the product may have been deleted
+                pass
         return total
     
     # ==========
@@ -199,14 +205,7 @@ class AbstractBasket(models.Model):
         Return total price excluding tax and discounts
         """
         return self._get_total('line_price_excl_tax')
-    
-    @property
-    def total_incl_tax(self):
-        """
-        Return total price inclusive of tax and discounts
-        x"""
-        return self._get_total('line_price_incl_tax_and_discounts')
-    
+ 
     @property
     def num_lines(self):
         """Return number of lines"""
@@ -239,7 +238,9 @@ class AbstractBasket(models.Model):
     
     
 class AbstractLine(models.Model):
-    """A line of a basket (product and a quantity)"""
+    """
+    A line of a basket (product and a quantity)
+    """
 
     basket = models.ForeignKey('basket.Basket', related_name='lines')
     # This is to determine which products belong to the same line
@@ -251,10 +252,13 @@ class AbstractLine(models.Model):
     product = models.ForeignKey('catalogue.Product', related_name='basket_lines')
     quantity = models.PositiveIntegerField(default=1)
     
+    # Track date of first addition
+    date_created = models.DateTimeField(auto_now_add=True)
+    
     # Instance variables used to persist discount information
-    _discount_field = 'price_excl_tax'
     _discount = Decimal('0.00')
     _affected_quantity = 0
+    _charge_tax = True
     
     class Meta:
         abstract = True
@@ -271,9 +275,19 @@ class AbstractLine(models.Model):
             return self.delete(*args, **kwargs)
         super(AbstractLine, self).save(*args, **kwargs)
 
+    def set_as_tax_exempt(self):
+        self._charge_tax = False
+    
     # =============
     # Offer methods
     # =============
+    
+    def clear_discount(self):
+        """
+        Remove any discounts from this line.
+        """
+        self._discount = Decimal('0.00')
+        self._affected_quantity = 0
     
     def discount(self, discount_value, affected_quantity):
         self._discount += discount_value
@@ -310,10 +324,15 @@ class AbstractLine(models.Model):
         if not self.product.stockrecord:
             return None
         else:
-            return getattr(self.product.stockrecord, property)
+            attr = getattr(self.product.stockrecord, property)
+            if attr is None:
+                attr = Decimal('0.00')
+            return attr
     
     @property
     def _tax_ratio(self):
+        if not self.unit_price_incl_tax:
+            return 0 
         return self.unit_price_excl_tax / self.unit_price_incl_tax
     
     # ==========
@@ -342,14 +361,18 @@ class AbstractLine(models.Model):
         return self._get_stockrecord_property('price_excl_tax')
     
     @property
-    def unit_tax(self):
-        """Return tax of a unit"""
-        return self._get_stockrecord_property('price_tax')
-    
-    @property
     def unit_price_incl_tax(self):
         """Return unit price including tax"""
+        if not self._charge_tax:
+            return self.unit_price_excl_tax
         return self._get_stockrecord_property('price_incl_tax')
+
+    @property
+    def unit_tax(self):
+        """Return tax of a unit"""
+        if not self._charge_tax:
+            return Decimal('0.00')
+        return self._get_stockrecord_property('price_tax')
     
     @property
     def line_price_excl_tax(self):
@@ -382,7 +405,7 @@ class AbstractLine(models.Model):
         for attribute in self.attributes.all():
             ops.append("%s = '%s'" % (attribute.option.name, attribute.value))
         if ops:
-            d = "%s (%s)" % (d, ", ".join(ops))
+            d = "%s (%s)" % (d.decode('utf-8'), ", ".join(ops))
         return d
     
     

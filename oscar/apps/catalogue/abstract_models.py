@@ -3,9 +3,13 @@ Models of products
 """
 import re
 from itertools import chain
+from datetime import datetime, date
 
 from django.db import models
+from django.core.validators import RegexValidator
+from django.db.models import get_model
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.utils.translation import ugettext_lazy as _
 from django.template.defaultfilters import slugify
 from django.core.exceptions import ObjectDoesNotExist
@@ -13,6 +17,7 @@ from treebeard.mp_tree import MP_Node
 
 from oscar.apps.catalogue.managers import BrowsableProductManager
 
+ENABLE_ATTRIBUTE_BINDING = getattr(settings, 'OSCAR_ENABLE_ATTRIBUTE_BINDING', False)
 
 class AbstractProductClass(models.Model):
     """
@@ -173,8 +178,8 @@ class AbstractProduct(models.Model):
     description = models.TextField(_('Description'), blank=True, null=True)
     product_class = models.ForeignKey('catalogue.ProductClass', verbose_name=_('product class'), null=True,
         help_text="""Choose what type of product this is""")
-    attribute_types = models.ManyToManyField('catalogue.AttributeType', through='ProductAttributeValue',
-        help_text="""An attribute type is something that this product MUST have, such as a size""")
+    attributes = models.ManyToManyField('catalogue.ProductAttribute', through='ProductAttributeValue',
+        help_text="""A product attribute is something that this product MUST have, such as a size, as specified by its class""")
     product_options = models.ManyToManyField('catalogue.Option', blank=True, 
         help_text="""Options are values that can be associated with a item when it is added to 
                      a customer's basket.  This could be something like a personalised message to be
@@ -294,14 +299,28 @@ class AbstractProduct(models.Model):
         return ('catalogue:detail', (), {
             'product_slug': self.slug,
             'pk': self.id})
+        
+    def __init__(self, *args, **kwargs):
+        super(AbstractProduct, self).__init__(*args, **kwargs)
+        if ENABLE_ATTRIBUTE_BINDING:
+            self.attr = ProductAttributesContainer(product=self)
     
     def save(self, *args, **kwargs):
         if self.is_top_level and not self.title:
-            from django.core.exceptions import ValidationError
             raise ValidationError("Canonical products must have a title")
         if not self.slug:
             self.slug = slugify(self.get_title())
+        
+        # Validate attributes if necessary
+        if ENABLE_ATTRIBUTE_BINDING:
+            self.attr.validate_attributes()
+            
+        # Save product
         super(AbstractProduct, self).save(*args, **kwargs)
+        
+        # Finally, save attributes
+        if ENABLE_ATTRIBUTE_BINDING:
+            self.attr.save()
 
 
 class ProductRecommendation(models.Model):
@@ -313,58 +332,292 @@ class ProductRecommendation(models.Model):
     ranking = models.PositiveSmallIntegerField(default=0)
 
 
-class AbstractAttributeType(models.Model):
-    u"""Defines an attribute. (Eg. size)"""
+class ProductAttributesContainer(object):
+    """
+    Stolen liberally from django-eav, but simplified to be product-specific
+    """
     
+    def __init__(self, product):
+        self.product = product
+        self.initialised = False
+
+    def __getattr__(self, name):
+        if not name.startswith('_') and not self.initialised:
+            values = list(self.get_values().select_related('attribute'))
+            result = None
+            for v in values:
+                setattr(self, v.attribute.code, v.value)
+                if v.attribute.code == name:
+                    result = v.value
+            self.initialised = True
+            if result:
+                return result
+        raise AttributeError((_(u"%(obj)s has no attribute named " \
+                                       u"'%(attr)s'") % \
+                                     {'obj': self.product.product_class, 'attr': name}))
+        
+    def validate_attributes(self):
+        for attribute in self.get_all_attributes():
+            value = getattr(self, attribute.code, None)
+            if value is None:
+                if attribute.required:
+                    raise ValidationError(_(u"%(attr)s attribute cannot " \
+                                            u"be blank") % \
+                                            {'attr': attribute.code})
+            else:
+                try:
+                    attribute.validate_value(value)
+                except ValidationError, e:
+                    raise ValidationError(_(u"%(attr)s attribute %(err)s") % \
+                                            {'attr': attribute.code,
+                                             'err': e})
+        
+    def get_values(self):
+        return self.product.productattributevalue_set.all()
+    
+    def get_value_by_attribute(self, attribute):
+        return self.get_values().get(attribute=attribute)    
+    
+    def get_all_attributes(self):
+        return self.product.product_class.attributes.all()
+    
+    def get_attribute_by_code(self, code):
+        return self.get_all_attributes().get(code=code)
+    
+    def __iter__(self):
+        return iter(self.get_values())
+    
+    def save(self):
+        for attribute in self.get_all_attributes():
+            if hasattr(self, attribute.code):
+                value = getattr(self, attribute.code)
+                attribute.save_value(self.product, value)
+
+
+class AbstractProductAttribute(models.Model):
+    
+    TYPE_CHOICES = (
+        ("text", "Text"), 
+        ("integer", "Integer"),
+        ("boolean", "True / False"), 
+        ("float", "Float"), 
+        ("richtext", "Rich Text"), 
+        ("date", "Date"), 
+        ("option", "Option"),
+        ("entity", "Entity"),
+    )
+    
+    """
+    Defines an attribute for a product class. (For example, number_of_pages for a 'book' class)
+    """
     product_class = models.ForeignKey('catalogue.ProductClass', related_name='attributes', blank=True, null=True)
     name = models.CharField(_('name'), max_length=128)
-    code = models.SlugField(_('code'), max_length=128)
-        
-    has_choices = models.BooleanField(default=False)
+    code = models.SlugField(_('code'), max_length=128, validators=[RegexValidator(regex=r'^[a-zA-Z_][0-9a-zA-Z_]*$', message="Code must match ^[a-zA-Z_][0-9a-zA-Z_]*$")])
+    type = models.CharField(choices=TYPE_CHOICES, default=TYPE_CHOICES[0][0], max_length=20)
+    option_group = models.ForeignKey('catalogue.AttributeOptionGroup', blank=True, null=True, help_text='Select an option group if using type "Option"')
+    entity_type = models.ForeignKey('catalogue.AttributeEntityType', blank=True, null=True, help_text='Select an entity type if using type "Entity"')
+    required = models.BooleanField(default=False)
 
     class Meta:
-        abstract = True
+        abstract = True 
         ordering = ['code']
+
+    def _validate_text(self, value):
+        if not (type(value) == unicode or type(value) == str):
+            raise ValidationError(_(u"Must be str or unicode"))
+
+    def _validate_float(self, value):
+        try:
+            float(value)
+        except ValueError:
+            raise ValidationError(_(u"Must be a float"))
+
+    def _validate_int(self, value):
+        try:
+            int(value)
+        except ValueError:
+            raise ValidationError(_(u"Must be an integer"))
+
+    def _validate_date(self, value):
+        if not (isinstance(value, datetime) or isinstance(value, date)):
+            raise ValidationError(_(u"Must be a date or datetime"))
+
+    def _validate_bool(self, value):
+        if not type(value) == bool:
+            raise ValidationError(_(u"Must be a boolean"))
+
+    def _validate_entity(self, value):
+        if not isinstance(value, get_model('catalogue', 'AttributeEntity')):
+            raise ValidationError(_(u"Must be an AttributeEntity model object instance"))
+        if not value.pk:
+            raise ValidationError(_(u"Model has not been saved yet"))
+        if value.type != self.entity_type:
+            raise ValidationError(_(u"Entity must be of type %s" % self.entity_type.name))
+
+    def _validate_option(self, value):
+        if not isinstance(value, get_model('catalogue', 'AttributeOption')):
+            raise ValidationError(_(u"Must be an AttributeOption model object instance"))
+        if not value.pk:
+            raise ValidationError(_(u"AttributeOption has not been saved yet"))
+        valid_values = self.option_group.options.values_list('option', flat=True)
+        if value not in valid_values:
+            raise ValidationError(_(u"%(enum)s is not a valid choice "
+                                        u"for %(attr)s") % \
+                                       {'enum': value, 'attr': self})        
+
+
+    def get_validator(self):
+        DATATYPE_VALIDATORS = {
+            'text': self._validate_text,
+            'integer': self._validate_int,
+            'boolean': self._validate_bool,
+            'float': self._validate_float,
+            'richtext': self._validate_text,
+            'date': self._validate_date,
+            'entity': self._validate_entity,
+            'option': self._validate_option,
+        }
+
+        return DATATYPE_VALIDATORS[self.type]     
 
     def __unicode__(self):
         return self.name
 
     def save(self, *args, **kwargs):
-        if not self.code:
-            self.code = slugify(self.name)
-        super(AbstractAttributeType, self).save(*args, **kwargs)
+        super(AbstractProductAttribute, self).save(*args, **kwargs)
         
-
-class AbstractAttributeValueOption(models.Model):
-    u"""Defines an attribute value choice (Eg: S,M,L,XL for a size attribute type)"""
-    type = models.ForeignKey('catalogue.AttributeType', related_name='options')
-    value = models.CharField(max_length=255)
-
-    class Meta:
-        abstract = True
-
-    def __unicode__(self):
-        return u"%s = %s" % (self.type, self.value)
+    def save_value(self, product, value):
+        try:
+            value_obj = product.productattributevalue_set.get(attribute=self)
+        except get_model('catalogue', 'ProductAttributeValue').DoesNotExist:
+            if value == None or value == '':
+                return
+            value_obj = get_model('catalogue', 'ProductAttributeValue').objects.create(product=product, attribute=self)
+        if value == None or value == '':
+            value_obj.delete()
+            return
+        if value != value_obj.value:
+            value_obj.value = value
+            value_obj.save()
+    
+    def validate_value(self, value):
+        self.get_validator()(value)
+        
+    def is_value_valid(self, value):
+        """
+        Check whether the passed value is valid for this attribute
+        """
+        if self.type == 'option':
+            valid_values = self.option_group.options.values_list('option', flat=True)
+            return value in valid_values
+        return True
 
 
 class AbstractProductAttributeValue(models.Model):
-    u"""
-    The "through" model for the m2m relationship between catalogue.Item
-    and catalogue.AttributeType.  This specifies the value of the attribute
-    for a particular catalogue.
-    
-    Eg: size = L
     """
-    product = models.ForeignKey('catalogue.Product', related_name='attributes')
-    type = models.ForeignKey('catalogue.AttributeType')
-    value = models.CharField(max_length=255)
+    The "through" model for the m2m relationship between catalogue.Product
+    and catalogue.ProductAttribute.  
+    This specifies the value of the attribute for a particular product
+    
+    For example: number_of_pages = 295
+    """
+    attribute = models.ForeignKey('catalogue.ProductAttribute')
+    product = models.ForeignKey('catalogue.Product')
+    value_text = models.CharField(max_length=255, blank=True, null=True)
+    value_integer = models.IntegerField(blank=True, null=True)
+    value_boolean = models.BooleanField(blank=True)
+    value_float = models.FloatField(blank=True, null=True)
+    value_richtext = models.TextField(blank=True, null=True)
+    value_date = models.DateField(blank=True, null=True)
+    value_option = models.ForeignKey('catalogue.AttributeOption', blank=True, null=True)
+    value_entity = models.ForeignKey('catalogue.AttributeEntity', blank=True, null=True)
+    
+    def _get_value(self):
+        return getattr(self, 'value_%s' % self.attribute.type)
+    
+    def _set_value(self, new_value):
+        if self.attribute.type == 'option' and isinstance(new_value, str):
+            # Need to look up instance of AttributeOption
+            new_value = self.attribute.option_group.options.get(option=new_value)
+        setattr(self, 'value_%s' % self.attribute.type, new_value)
+    
+    value = property(_get_value, _set_value)
+    
+    class Meta:
+        abstract = True 
+        
+    def __unicode__(self):
+        return u"%s: %s" % (self.attribute.name, self.value)
+    
+    
+class AbstractAttributeOptionGroup(models.Model):
+    """
+    Defines a group of options that collectively may be used as an 
+    attribute type
+    For example, Language
+    """
+    name = models.CharField(max_length=128)
+    
+    def __unicode__(self):
+        return self.name
     
     class Meta:
         abstract = True
-        unique_together = ['product', 'type']
-        
+
+
+class AbstractAttributeOption(models.Model):
+    """
+    Provides an option within an option group for an attribute type
+    Examples: In a Language group, English, Greek, French
+    """
+    group = models.ForeignKey('catalogue.AttributeOptionGroup', related_name='options')
+    option = models.CharField(max_length=255)
+    
     def __unicode__(self):
-        return u"%s: %s" % (self.type.name, self.value)
+        return self.option
+    
+    class Meta:
+        abstract = True
+    
+    
+class AbstractAttributeEntity(models.Model):
+    """
+    Provides an attribute type to enable relationships with other models
+    """
+    name = models.CharField(_("Name"), max_length=255)
+    slug = models.SlugField(max_length=255, unique=False, blank=True)
+    type = models.ForeignKey('catalogue.AttributeEntityType', related_name='entities')
+
+    def __unicode__(self):
+        return self.name
+    
+    class Meta:
+        abstract = True
+        verbose_name_plural = 'Attribute entities'
+        
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)
+        super(AbstractAttributeEntity, self).save(*args, **kwargs)
+
+
+class AbstractAttributeEntityType(models.Model):
+    """
+    Provides the name of the model involved in an entity relationship
+    """
+    name = models.CharField(_("Name"), max_length=255)
+    slug = models.SlugField(max_length=255, unique=False, blank=True)
+    
+    def __unicode__(self):
+        return self.name
+        
+    class Meta:
+        abstract = True
+        
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            self.slug = slugify(self.name)
+        super(AbstractAttributeEntityType, self).save(*args, **kwargs)
     
     
 class AbstractOption(models.Model):

@@ -1,17 +1,17 @@
 from decimal import Decimal
 import datetime
 
-from django.utils import unittest
-from django.test.client import Client
+from django.test import TestCase
 
-from oscar.apps.offer.models import * 
+from oscar.apps.offer.models import (Range, CountCondition, ValueCondition,
+                                     CoverageCondition, ConditionalOffer,
+                                     PercentageDiscountBenefit, FixedPriceBenefit,
+                                     MultibuyDiscountBenefit, AbsoluteDiscountBenefit)
 from oscar.apps.basket.models import Basket
-from oscar.apps.catalogue.models import Product, ProductClass
-from oscar.apps.partner.models import Partner, StockRecord
 from oscar.test.helpers import create_product
 
 
-class RangeTest(unittest.TestCase):
+class RangeTest(TestCase):
     
     def setUp(self):
         self.prod = create_product()
@@ -51,10 +51,9 @@ class RangeTest(unittest.TestCase):
         self.assertFalse(range.contains_product(self.prod))
 
 
-class OfferTest(unittest.TestCase):
-    
+class OfferTest(TestCase):
     def setUp(self):
-        self.range = Range.objects.create(name="All products", includes_all_products=True)
+        self.range = Range.objects.create(name="All products range", includes_all_products=True)
         self.basket = Basket.objects.create()
 
 
@@ -82,7 +81,6 @@ class CountConditionTest(OfferTest):
         
     
 class ValueConditionTest(OfferTest):
-    
     def setUp(self):
         super(ValueConditionTest, self).setUp()
         self.cond = ValueCondition(range=self.range, type="Count", value=Decimal('10.00'))
@@ -109,7 +107,7 @@ class ValueConditionTest(OfferTest):
         self.assertEquals(1, self.basket.all_lines()[0].quantity_without_discount)
 
       
-class CoverageConditionTest(unittest.TestCase):
+class CoverageConditionTest(TestCase):
     
     def setUp(self):
         self.products = [create_product(Decimal('5.00')), create_product(Decimal('10.00'))]
@@ -276,7 +274,7 @@ class FixedPriceBenefitTest(OfferTest):
          
         
     
-class ConditionalOfferTest(unittest.TestCase):
+class ConditionalOfferTest(TestCase):
    
     def test_is_active(self):
         start = datetime.date(2011, 01, 01)
@@ -291,30 +289,6 @@ class ConditionalOfferTest(unittest.TestCase):
         end = datetime.date(2011, 02, 01)
         offer = ConditionalOffer(start_date=start, end_date=end)
         self.assertFalse(offer.is_active(test))
-        
-    
-class VoucherTest(unittest.TestCase):
-    
-    def test_is_active(self):
-        start = datetime.date(2011, 01, 01)
-        test = datetime.date(2011, 01, 10)
-        end = datetime.date(2011, 02, 01)
-        voucher = Voucher(start_date=start, end_date=end)
-        self.assertTrue(voucher.is_active(test))
-
-    def test_is_inactive(self):
-        start = datetime.date(2011, 01, 01)
-        test = datetime.date(2011, 03, 10)
-        end = datetime.date(2011, 02, 01)
-        voucher = Voucher(start_date=start, end_date=end)
-        self.assertFalse(voucher.is_active(test))
-        
-    def test_codes_are_saved_as_uppercase(self):
-        start = datetime.date(2011, 01, 01)
-        end = datetime.date(2011, 02, 01)
-        voucher = Voucher(name="Dummy voucher", code="lowercase", start_date=start, end_date=end)
-        voucher.save()
-        self.assertEquals("LOWERCASE", voucher.code)
         
 
     

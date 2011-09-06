@@ -93,7 +93,7 @@ class CheckoutSessionMixin(object):
             method = FreeShipping()
         return method
     
-    def get_order_totals(self, basket=None, shipping_method=None):
+    def get_order_totals(self, basket=None, shipping_method=None, **kwargs):
         """
         Returns the total for the order with and without tax (as a tuple)
         """
@@ -102,8 +102,8 @@ class CheckoutSessionMixin(object):
             basket = self.request.basket
         if not shipping_method:
             shipping_method = self.get_shipping_method(basket)
-        total_incl_tax = calc.order_total_incl_tax(basket, shipping_method)
-        total_excl_tax = calc.order_total_excl_tax(basket, shipping_method)
+        total_incl_tax = calc.order_total_incl_tax(basket, shipping_method, **kwargs)
+        total_excl_tax = calc.order_total_excl_tax(basket, shipping_method, **kwargs)
         return total_incl_tax, total_excl_tax
     
     def get_context_data(self, **kwargs):
@@ -149,10 +149,14 @@ class ShippingAddressView(CheckoutSessionMixin, FormView):
         return self.checkout_session.new_shipping_address_fields()
     
     def get_context_data(self, **kwargs):
+        kwargs = super(ShippingAddressView, self).get_context_data(**kwargs)
         if self.request.user.is_authenticated():
             # Look up address book data
-            kwargs['addresses'] = UserAddress._default_manager.filter(user=self.request.user)
+            kwargs['addresses'] = self.get_available_addresses()
         return kwargs
+    
+    def get_available_addresses(self):
+        return UserAddress._default_manager.filter(user=self.request.user)
     
     def post(self, request, *args, **kwargs):
         # Check if a shipping address was selected directly (eg no form was filled in)
@@ -179,7 +183,7 @@ class ShippingAddressView(CheckoutSessionMixin, FormView):
         return reverse('checkout:shipping-method')
     
 
-class UserAddressCreateView(CreateView):
+class UserAddressCreateView(CheckoutSessionMixin, CreateView):
     """
     Add a USER address to the user's addressbook.
 
@@ -206,7 +210,7 @@ class UserAddressCreateView(CreateView):
         return HttpResponseRedirect(reverse('checkout:shipping-address'))
     
     
-class UserAddressUpdateView(UpdateView):
+class UserAddressUpdateView(CheckoutSessionMixin, UpdateView):
     """
     Update a user address
     """
@@ -218,7 +222,7 @@ class UserAddressUpdateView(UpdateView):
 
     def get_context_data(self, **kwargs):
         kwargs = super(UserAddressUpdateView, self).get_context_data(**kwargs)
-        kwargs['form_url'] = reverse('checkout:user-address-update', args=(str(kwargs['object'].id)))
+        kwargs['form_url'] = reverse('checkout:user-address-update', args=(str(kwargs['object'].id),))
         return kwargs
 
     def get_success_url(self):
@@ -226,7 +230,7 @@ class UserAddressUpdateView(UpdateView):
         return reverse('checkout:shipping-address')
     
     
-class UserAddressDeleteView(DeleteView):
+class UserAddressDeleteView(CheckoutSessionMixin, DeleteView):
     """
     Delete an address from a user's addressbook.
     """
@@ -328,7 +332,7 @@ class OrderPlacementMixin(CheckoutSessionMixin):
     # Any payment sources should be added to this list as part of the
     # _handle_payment method.  If the order is placed successfully, then
     # they will be persisted.
-    payment_sources = []
+    _payment_sources = None
     
     def handle_order_placement(self, order_number, basket, total_incl_tax, total_excl_tax, **kwargs): 
         """
@@ -342,6 +346,11 @@ class OrderPlacementMixin(CheckoutSessionMixin):
         order = self.place_order(order_number, basket, total_incl_tax, total_excl_tax, **kwargs)
         basket.set_as_submitted()
         return self.handle_successful_order(order)
+        
+    def add_payment_source(self, source):
+        if self._payment_sources is None:
+            self._payment_sources = []
+        self._payment_sources.append(source)  
         
     def handle_successful_order(self, order):  
         """
@@ -463,7 +472,9 @@ class OrderPlacementMixin(CheckoutSessionMixin):
         When the payment sources are created, the order model does not exist and 
         so they need to have it set before saving.
         """
-        for source in self.payment_sources:
+        if not self._payment_sources:
+            return
+        for source in self._payment_sources:
             source.order = order
             source.save()
     
@@ -485,14 +496,25 @@ class OrderPlacementMixin(CheckoutSessionMixin):
         self.request.basket = fzn_basket
 
     def send_confirmation_message(self, order):
-        # Create order communication event
+        code = 'ORDER_PLACED'
+        ctx = {'order': order}
         try:
-            event_type = CommunicationEventType._default_manager.get(code='ORDER_PLACED')
+            event_type = CommunicationEventType.objects.get(code=code)
         except CommunicationEventType.DoesNotExist:
-            logger.error(_("Order #%s: unable to find 'order_placed' comms event" % order.number))
+            # No event in database, attempt to find templates for this type
+            messages = CommunicationEventType.objects.get_and_render(code, ctx)
+            event_type = None
         else:
+            # Create order event
+            CommunicationEvent._default_manager.create(order=order, type=event_type)
+            messages = event_type.get_messages(ctx)
+
+        if messages and messages['body']:      
+            logger.info("Order #%s - sending %s messages", order.number, code)  
             dispatcher = Dispatcher(logger)
-            dispatcher.dispatch_order_message(order, event_type)
+            dispatcher.dispatch_order_messages(order, messages, event_type)
+        else:
+            logger.warning("Order #%s - no %s communication event type", order.number, code)
 
 
 class PaymentDetailsView(OrderPlacementMixin, TemplateView):
@@ -556,10 +578,12 @@ class PaymentDetailsView(OrderPlacementMixin, TemplateView):
             # Something went wrong with payment, need to show
             # error to the user.  This type of exception is supposed
             # to set a friendly error message.
+            self.restore_frozen_basket()
             logger.info(_("Order #%s: unable to take payment (%s)" % (order_number, e)))
             return self.render_to_response(self.get_context_data(error=str(e)))
         except PaymentError, e:
             # Something went wrong which wasn't anticipated.
+            self.restore_frozen_basket()
             logger.error(_("Order #%s: payment error (%s)" % (order_number, e)))
             return self.render_to_response(self.get_context_data(error="A problem occurred processing payment."))
         else:
